@@ -1,52 +1,61 @@
 /*
  Solar router by PBU for ESP32
 */
+
+#include <U8g2lib.h>            // gestion affichage écran Oled  https://github.com/olikraus/U8g2_Arduino/ //
 #include <RBDdimmer.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
+#include <NTPClient.h>          // gestion de l'heure https://github.com/arduino-libraries/NTPClient //
+#include <OneWire.h>            // pour capteur de température DS18B20
+#include <DallasTemperature.h>  // pour capteur de température DS18B20 https://github.com/milesburton/Arduino-Temperature-Control-Library
 #include "config.h"
 
-#define zerocross  1 // for boards with CHANGEBLE input pins
-#define outputPin  2 //12 
+const int zeroCrossPin = 35;    // broche utilisée pour le zéro crossing
+const int pulsePin = 25;        // broche impulsions routage 1
+
 #define BUILTIN_LED 2
 
 #define STEP 1
 #define MAX_POWER 100
 #define MIN_POWER   0
 
-#define RXD2 13 // For ESP32 - ESP8266 RXD2 = GPIO 13
-#define TXD2 15 // For ESP32 -ESP8266 = GPIO 15
+#define RXD2 16
+#define TXD2 17
 
 #define MK194_FACTORY_SPEED 4800
 #define MK194_SPEED 38400
 
-long baudRates[] = { 4800, 9600, 19200, 38400, 57600, 115200 };  // array of baud rates to test
-int numBaudRates = 1;      
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ 22, /* data=*/ 21);   // ESP32 Thing, HW I2C with pin remapping
 
+long baudRates[] = { 4800, 9600, 19200, 38400, 57600, 115200 };  // array of baud rates to test
 byte SensorData[62];
 
-dimmerLamp WaterHeaterDimmer(outputPin, zerocross); //initialase port for dimmer for ESP8266, ESP32, Arduino due boards
+dimmerLamp WaterHeaterDimmer(pulsePin, zeroCrossPin);
+
 int outVal = 0;
 
 const char* TopicPower                 = "Home/House/First/LivingRoom/Power";
 
-const char* TopicHello                 = "Home/Workshop/WaterHeater/Hello";
-const char* TopicSwitchForceOnCommand  = "Home/Workshop/WaterHeater/Switch/ForceON/command";
-const char* TopicSwitchForceOnState    = "Home/Workshop/WaterHeater/Switch/ForceON/state";
-const char* TopicSwitchForceOffCommand = "Home/Workshop/WaterHeater/Switch/ForceOFF/command";
-const char* TopicSwitchForceOffState   = "Home/Workshop/WaterHeater/Switch/ForceOFF/state";
-const char* TopicWaterHeaterAvailable  = "Home/Workshop/WaterHeater/available";
-const char* TopicDimmerSliderCommand   = "Home/Workshop/WaterHeater/Dimmer/Slider/command";
-const char* TopicDimmerSliderState     = "Home/Workshop/WaterHeater/Dimmer/Slider/state";
+const char* TopicHello                 = "Home/Workshop/WaterHeaterPlus/Hello";
+const char* TopicSwitchForceOnCommand  = "Home/Workshop/WaterHeaterPlus/Switch/ForceON/command";
+const char* TopicSwitchForceOnState    = "Home/Workshop/WaterHeaterPlus/Switch/ForceON/state";
+const char* TopicSwitchForceOffCommand = "Home/Workshop/WaterHeaterPlus/Switch/ForceOFF/command";
+const char* TopicSwitchForceOffState   = "Home/Workshop/WaterHeaterPlus/Switch/ForceOFF/state";
+const char* TopicWaterHeaterAvailable  = "Home/Workshop/WaterHeaterPlus/available";
+const char* TopicDimmerSliderCommand   = "Home/Workshop/WaterHeaterPlus/Dimmer/Slider/command";
+const char* TopicDimmerSliderState     = "Home/Workshop/WaterHeaterPlus/Dimmer/Slider/state";
 
-const char* TopicSensorPower           = "Home/Workshop/WaterHeater/Sensor/Power";
-const char* TopicSensorWaterTemp       = "Home/Workshop/WaterHeater/Sensor/WaterTemp";
-const char* TopicSensorDimmerTemp      = "Home/Workshop/WaterHeater/Sensor/DimmerTemp";
+const char* TopicSensorPower           = "Home/Workshop/WaterHeaterPlus/Sensor/Power";
+const char* TopicSensorWaterTemp       = "Home/Workshop/WaterHeaterPlus/Sensor/WaterTemp";
+const char* TopicSensorDimmerTemp      = "Home/Workshop/WaterHeaterPlus/Sensor/DimmerTemp";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
-
+WiFiUDP ntpUDP;
+// Choix du serveur NTP pour récupérer l'heure, 3600 =1h est le fuseau horaire et 60000=60s est le * taux de rafraichissement
+NTPClient temps(ntpUDP, "fr.pool.ntp.org", 3600, 60000);
 
 unsigned long lastMsg = 0;
 #define MSG_BUFFER_SIZE	(50)
@@ -59,16 +68,37 @@ int8_t m_iDimmerStep = 0;
 bool m_bForceON = false;
 bool m_bForceOFF = false;
 
+// Modbus RTU message to get the data
+byte JSKReadPower[] = { 0x01, 0x03, 0x00, 0x48, 0x00, 0x04, 0xC4, 0x1F };
+float voltage          = 0;
+float current          = 0;
+float power            = 0;
+float energy           = 0;
+float temperatureC     = 0;    
+float EnergySavedDaily = 0;  // énergie sauvées le jour J et remise à zéro tous les jours //
+float EnergyInitDaily  = 0;  // Energie en debut de journee, lu a 00:00:00
+int Start              = 1;  // variable de démarrage du programme //
+
+const int oneWireBus = 32; // broche du capteur DS18B20 //
+OneWire oneWire(oneWireBus); // instance de communication avec le capteur de température
+DallasTemperature sensors(&oneWire); // correspondance entreoneWire et le capteur Dallas de température
+
+// Multi-core
+TaskHandle_t Task1, Task2, Task3;
+
 void setup() {
+
+  // ECRAN OLED
+  u8g2.begin(); 
+  u8g2.enableUTF8Print(); //nécessaire pour écrire des caractères accentués
+  Display();
 
   // Initialize the BUILTIN_LED pin as an output
   pinMode(BUILTIN_LED, OUTPUT); 
-  digitalWrite(BUILTIN_LED, HIGH);
+  digitalWrite(BUILTIN_LED, LOW);
 
   // Initialize the Serial USB    
   Serial.begin(115200);
-  Serial2.begin(MK194_FACTORY_SPEED); 
-  delay(500);
 
   // Initialize the Wifi
   setup_wifi();
@@ -76,33 +106,145 @@ void setup() {
   // Initialize Mqtt
   client.setServer(MQTT_BROKER_IP, 1883);
   client.setCallback(callback);
+  
+  //Intialisation du client NTP
+  temps.begin(); 
+
+  delay(500);
 
   OTASetup();
 
+  delay(500);
+
+  // initialisation du capteur DS18B20
+  sensors.begin(); 
+
+   // initialisation du capteurJSY
+  setup_JSY();
+
    // Turn the Dimmer on, power 0
   WaterHeaterDimmer.begin(NORMAL_MODE, OFF);
+
+  Serial.println("Create Task_PowerMonitoring on Core 0");
+  
+  // Code pour créer un Task Core 0//
+  xTaskCreatePinnedToCore(
+    Task_PowerMonitoring, /* Task function. */
+    "Task1",              /* name of task. */
+    10000,                /* Stack size of task */
+    NULL,                 /* parameter of the task */
+    1,                    /* priority of the task */
+    &Task1,               /* Task handle to keep track of created task */
+    0);                   /* pin task to core 0 */
+
+
+  Serial.println("Create Task_Screen on Core 1");
+  xTaskCreatePinnedToCore(
+    Task_Screen, /* Task function. */
+    "Screen",    /* name of task. */
+    40000,       /* Stack size of task */
+    NULL,        /* parameter of the task */
+    2,           /* priority of the task */
+    &Task2,      /* Task handle to keep track of created task */
+    1);          /* pin task to core 1 */
+
+  Serial.println("Create Task_Communication on Core 1");
+  xTaskCreatePinnedToCore(
+    Task_Communication, /* Task function. */
+    "Communication",    /* name of task. */
+    40000,       /* Stack size of task */
+    NULL,        /* parameter of the task */
+    2,           /* priority of the task */
+    &Task3,      /* Task handle to keep track of created task */
+    1);          /* pin task to core 1 */
+}
+
+void Task_PowerMonitoring(void *pvParameters) {
+  Serial.println("Task_PowerMonitoring");
+  const TickType_t taskPeriod = 330;  // In ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    //MQTT loop to read power send to network
+    client.loop();
+
+    //Calculate and set dimmer value
+    DimmerLoop();
+
+    vTaskDelayUntil(&xLastWakeTime, taskPeriod);
+  }
+}
+
+void Task_Communication(void *pvParameters) {
+  Serial.println("Task_Communication");
+  const TickType_t taskPeriod = 1000;  // In ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+
+    // Mqqt connection
+    reconnect();
+
+    temps.update();
+
+    // OTA loop
+    OTALoop();
+
+    vTaskDelayUntil(&xLastWakeTime, taskPeriod);
+  }
+}
+
+void Task_Screen(void *pvParameters) {
+  Serial.println("Task_Screen");
+  const TickType_t taskPeriod = 1000;  // In ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+
+     // Read water heather power consumption
+    ReadPowerMeterSensor();
+
+    // Read water Temperature
+    ReadTemperature();
+
+    CalculateEnergyDaily();
+
+    Display();
+
+    vTaskDelayUntil(&xLastWakeTime, taskPeriod);
+  }
+}
+
+void setup_JSY(){
+  Serial2.begin(MK194_FACTORY_SPEED, SERIAL_8N1, RXD2, TXD2); //PORT DE CONNEXION AVEC LE CAPTEUR JSY-MK-194
+    // Read water heather power consumption
+  if (ReadPowerMeterSensor()) {
+    Serial.printf("Sensor is working at speed : %d\n\r", MK194_FACTORY_SPEED);
+  }
 }
 
 void setup_wifi() {
-
-  delay(100);
   // We start by connecting to a WiFi network
-  Serial.println();
+  // Serial.println();
   Serial.printf("Connecting to %s ", WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    BlinkLED();
     Serial.print(".");
+    delay(500);
   }
 
   randomSeed(micros());
 
-  Serial.print(" WiFi connected on IP address: ");
-  // Serial.print("IP address: ");
+  Serial.println();
+  Serial.print("WiFi connected on IP address: ");
   Serial.println(WiFi.localIP());
+
+  // Display blue LED : wifi connected
+  digitalWrite(BUILTIN_LED, HIGH); 
 }
 
 void SerialMqttMessage(char* topic, byte* payload, unsigned int length){
@@ -200,34 +342,15 @@ void reconnect() {
       m_iDimmerStep = 0;
       Serial.print("failed, rc=");
       Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
+      Serial.println(" try again in 1 seconds");
+      // Wait 1 seconds before retrying
+      delay(1000);
     }
   }
 }
 
-void loop() {
-
-  if (!client.connected()) {
-    reconnect();
-  }
-
-  client.loop();
-
-  //SerialHelloMessage();
-
-  //BlinkLED();
-  DimmerLoop();
-
-  OTALoop();
-
-  // Read water heather power consumption
-  ReadPowerMeterSensor();
-
-  // 330ms
-  delay(330);
-}
+// Everything is done in specific task
+void loop() {}
 
 void DimmerLoop() {
 
@@ -239,13 +362,6 @@ void DimmerLoop() {
     WaterHeaterDimmer.setPower(m_iDimmerPower); 
 
     PublishDimmer();
-
-    // Turn on the BUILTIN_LED if power is active
-    if (WaterHeaterDimmer.getState() == ON) {
-      //digitalWrite(BUILTIN_LED, LOW); 
-    } else {
-      //digitalWrite(BUILTIN_LED, HIGH);
-    }
   }
 }
 
@@ -257,6 +373,14 @@ void PublishDimmer() {
     client.publish(TopicDimmerSliderState, cDimmerPower, true);
 }
 
+void PublishTemperature() {
+    // Publish temperature of water C
+    char cTemperature[10];
+    sprintf(cTemperature, "%f", temperatureC);
+    Serial.printf("Message send : [%s] %s\n\r", TopicSensorWaterTemp, cTemperature); 
+    client.publish(TopicSensorWaterTemp, cTemperature, true);
+}
+
 void BlinkLED() {
   if ( digitalRead(BUILTIN_LED) == LOW){
     digitalWrite(BUILTIN_LED, HIGH); 
@@ -266,63 +390,130 @@ void BlinkLED() {
   }
 }
 
-void SerialHelloMessage() {
-  unsigned long now = millis();
-  if (now - lastMsg > 2000) {
-    lastMsg = now;
-    ++value;
-    snprintf (msg, MSG_BUFFER_SIZE, "hello world #%ld", value);
-    Serial.print("Publish message: ");
-    Serial.println(msg);
-    client.publish(TopicHello, msg);
-  }
-}
-
 bool ReadPowerMeterSensor() {
-  // Modbus RTU message to get the data
-  byte msg[] = { 0x01, 0x03, 0x00, 0x48, 0x00, 0x0E, 0x44, 0x18 };
-  int len = sizeof(msg);
+  
 
   // Reset data
-  for (int i = 0; i < sizeof(SensorData); i++) {
-    SensorData[i] = 0x00;
+  memset(SensorData, 0x00, sizeof(SensorData));
+
+   Serial2.flush();
+  // Send message
+  for (int i = 0; i < sizeof(JSKReadPower); i++) {
+    Serial2.write(JSKReadPower[i]);
   }
 
-  // Send message
-  for (int i = 0; i < len; i++) {
-    Serial2.write(msg[i]);
-  }
-  //delay(500);
+  delay(200);
 
   // Get data from JSY-MK-194
   int a = 0;
   while (Serial2.available()) {
-    SensorData[a] = Serial.read();
+    SensorData[a] = Serial2.read();
     a++;
   }
+
+  // Display response
+  for (int i = 0; i < a; i++) {
+    Serial.printf("%x:", SensorData[i]);
+  }
+  Serial.println();
+
   // Sanity Checks
   if (SensorData[0] != 0x01) {
-    char lenData[32];
-    itoa(a, lenData, 10);
-    Serial.println("JSY-MK-194 response error");
+    Serial.printf("ERROR2 - ReadPowerMeterSensor() - Message received do not start with 0x01, message length is %d\n\r", a);
     return false;
   }
 
-  if (a != 61) {
-    Serial.println("JSY-MK-194 response size error (!= 61)");
-    return false;
-  }
-
-  String resp; 
-  char digit[10];
-  for (int i = 0; i < a; i++) {
-
-    itoa(SensorData[i], digit, 16);
-    resp += digit;
-    resp += " ";
-  }
-  client.publish(TopicSensorPower, resp.c_str());
+  voltage = ConvertByteArrayToFloat(&SensorData[3]);
+  Serial.printf("voltage = %4.2f\n\r",voltage);
+  current = ConvertByteArrayToFloat(&SensorData[7]);
+  Serial.printf("current = %4.2f\n\r",current);
+  power = ConvertByteArrayToFloat(&SensorData[11]);
+  Serial.printf("power = %4.2f\n\r",power);
+  energy = ConvertByteArrayToFloat(&SensorData[15]);
+  Serial.printf("energy = %4.2f\n\r",energy);
 
   return true;
 }
 
+void Display() {
+  u8g2.clearBuffer(); // on efface ce qui se trouve déjà dans le buffer
+
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.setCursor(5, 10); // position du début du texte
+  u8g2.print("ROUTEUR S"); // écriture de texte
+  u8g2.setFont(u8g2_font_unifont_t_symbols);
+  u8g2.drawGlyph(49, 13, 0x2600);
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.setCursor(58, 10); // position du début du texte
+  u8g2.print("LAIREv1.0"); // écriture de texte
+  u8g2.drawRFrame(5,16,120,22,11); // rectangle x et y haut gauche / longueur / hauteur / arrondi //
+  u8g2.setCursor(75, 47);
+  u8g2.print(WiFi.localIP()); // affichage adresse ip //
+
+  if (m_bForceON || m_iDimmerSlider != 0) {
+    u8g2.setFont(u8g2_font_streamline_all_t);
+    u8g2.drawGlyph(5, 38, 0x00d9);
+  } else if (power > 20){
+    u8g2.setFont(u8g2_font_emoticons21_tr);
+    u8g2.drawGlyph(5, 38, 0x0036);
+  } else {
+    u8g2.setFont(u8g2_font_emoticons21_tr);
+    u8g2.drawGlyph(5, 38, 0x0026);
+  }
+
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.setCursor(30, 31);
+  u8g2.printf("%4.0f W %2.1f °", power, temperatureC);  
+
+  if (client.connected()) {
+    u8g2.setFont(u8g2_font_open_iconic_www_1x_t);
+    u8g2.drawGlyph(58 + 51, 11, 0x0053);    
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    u8g2.setFont(u8g2_font_open_iconic_www_1x_t);
+    u8g2.drawGlyph(58 + 62, 11, 0x0051);
+  }
+
+  // Display time
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.setCursor(5, 47);
+  u8g2.print(temps.getFormattedTime());
+
+  // Energy by day in WaterHeater
+  u8g2.setCursor(5, 55);
+  u8g2.printf("Energie/Jour : %2.1f KWh", EnergySavedDaily/1000);
+
+  u8g2.sendBuffer();  // l'image qu'on vient de construire est affichée à l'écran
+}
+
+void ReadTemperature() {
+  float newTemperatureC = 0;
+  sensors.requestTemperatures();                          // demande de température au capteur //
+  newTemperatureC = sensors.getTempCByIndex(0);              // température en degrés Celcius
+  Serial.printf("Temperature °C : %f\n\r", temperatureC);
+  if (newTemperatureC != temperatureC){
+    temperatureC = newTemperatureC;
+    PublishTemperature();
+  }
+ 
+}
+
+float ConvertByteArrayToFloat(byte* bytes) {
+  float value = (bytes[3]) | (bytes[2] << 8) | (bytes[1] << 16) | (bytes[0] << 24);
+  return value * 0.0001;
+}
+
+void CalculateEnergyDaily() {
+
+      if (temps.getHours() == 23 & temps.getMinutes() == 59 & temps.getSeconds() == 59) {
+      EnergySavedDaily = 0;
+      Start = 1;
+    }
+
+    if (Start == 1) {
+      EnergyInitDaily = energy;
+      Start = 0;
+    }
+
+    EnergySavedDaily = energy - EnergyInitDaily;
+}
