@@ -55,12 +55,9 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 WiFiUDP ntpUDP;
 // Choix du serveur NTP pour récupérer l'heure, 3600 =1h est le fuseau horaire et 60000=60s est le * taux de rafraichissement
-NTPClient temps(ntpUDP, "fr.pool.ntp.org", 3600, 60000);
+NTPClient timeNTP(ntpUDP, "fr.pool.ntp.org", 3600, 60000);
 
-unsigned long lastMsg = 0;
-#define MSG_BUFFER_SIZE	(50)
-char msg[MSG_BUFFER_SIZE];
-int value = 0;
+//int value = 0;
 int m_iExportedPower = 0;
 uint8_t m_iDimmerPower = 0;
 uint8_t m_iDimmerSlider = 0;
@@ -108,7 +105,7 @@ void setup() {
   client.setCallback(callback);
   
   //Intialisation du client NTP
-  temps.begin(); 
+  timeNTP.begin(); 
 
   delay(500);
 
@@ -185,7 +182,7 @@ void Task_Communication(void *pvParameters) {
     // Mqqt connection
     reconnect();
 
-    temps.update();
+    timeNTP.update();
 
     // OTA loop
     OTALoop();
@@ -477,11 +474,15 @@ void Display() {
   // Display time
   u8g2.setFont(u8g2_font_5x8_tf);
   u8g2.setCursor(5, 47);
-  u8g2.print(temps.getFormattedTime());
+  u8g2.print(timeNTP.getFormattedTime());
 
   // Energy by day in WaterHeater
   u8g2.setCursor(5, 55);
   u8g2.printf("Energie/Jour : %2.1f KWh", EnergySavedDaily/1000);
+
+  // Display power %
+  u8g2.setCursor(5, 63);
+  u8g2.printf("Puissance : %d %%", m_iDimmerPower);
 
   u8g2.sendBuffer();  // l'image qu'on vient de construire est affichée à l'écran
 }
@@ -489,7 +490,7 @@ void Display() {
 void ReadTemperature() {
   float newTemperatureC = 0;
   sensors.requestTemperatures();                          // demande de température au capteur //
-  newTemperatureC = sensors.getTempCByIndex(0);              // température en degrés Celcius
+  newTemperatureC = sensors.getTempCByIndex(0);           // température en degrés Celcius
   Serial.printf("Temperature °C : %f\n\r", temperatureC);
   if (newTemperatureC != temperatureC){
     temperatureC = newTemperatureC;
@@ -505,7 +506,7 @@ float ConvertByteArrayToFloat(byte* bytes) {
 
 void CalculateEnergyDaily() {
 
-      if (temps.getHours() == 23 & temps.getMinutes() == 59 & temps.getSeconds() == 59) {
+      if (timeNTP.getHours() == 23 & timeNTP.getMinutes() == 59 & timeNTP.getSeconds() == 59) {
       EnergySavedDaily = 0;
       Start = 1;
     }
